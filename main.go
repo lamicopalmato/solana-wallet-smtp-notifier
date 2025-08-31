@@ -16,13 +16,11 @@ import (
 
 const (
 	pollInterval = 30 * time.Second
-	lastTxFile   = "/opt/solana-notifier/last_tx.sig"
 )
 
 var (
-	solanaRPC     = os.Getenv("SOLANA_RPC")
-	walletAddress = os.Getenv("WALLET_ADDRESS")
-	lastTxSig     string
+	solanaRPC   = os.Getenv("SOLANA_RPC")
+	walletAddrs []string
 )
 
 type solanaResponse struct {
@@ -36,19 +34,21 @@ type solanaResponse struct {
 	ID int `json:"id"`
 }
 
-func readLastTx() string {
-	data, err := os.ReadFile(lastTxFile)
+func readLastTx(wallet string) string {
+	fileName := fmt.Sprintf("/opt/solana-notifier/last_tx_%s.sig", wallet)
+	data, err := os.ReadFile(fileName)
 	if err != nil {
-		log.Println("No last tx file found, starting fresh")
+		log.Printf("No last tx file found for wallet %s, starting fresh", wallet)
 		return ""
 	}
 	return strings.TrimSpace(string(data))
 }
 
-func writeLastTx(tx string) {
-	err := os.WriteFile(lastTxFile, []byte(tx), 0644)
+func writeLastTx(wallet string, tx string) {
+	fileName := fmt.Sprintf("/opt/solana-notifier/last_tx_%s.sig", wallet)
+	err := os.WriteFile(fileName, []byte(tx), 0644)
 	if err != nil {
-		log.Printf("Error writing last tx file: %v\n", err)
+		log.Printf("Error writing last tx file for wallet %s: %v", wallet, err)
 	}
 }
 
@@ -81,70 +81,94 @@ func sendEmail(subject, body string) error {
 	return nil
 }
 
-func checkTransactions() {
-	log.Println("Checking new transactions...")
+func checkTransactions(wallet string, lastTxSig string) (string, bool) {
+	log.Printf("Checking new transactions for wallet %s...", wallet)
 
 	payload := map[string]interface{}{
 		"jsonrpc": "2.0",
 		"id":      1,
 		"method":  "getSignaturesForAddress",
-		"params":  []interface{}{walletAddress, map[string]int{"limit": 1}},
+		"params":  []interface{}{wallet, map[string]int{"limit": 1}},
 	}
-	body, _ := json.Marshal(payload)
 
+	body, _ := json.Marshal(payload)
 	resp, err := http.Post(solanaRPC, "application/json", bytes.NewBuffer(body))
 	if err != nil {
-		log.Printf("Error making Solana request: %v\n", err)
-		return
+		log.Printf("Error making Solana request for %s: %v", wallet, err)
+		return lastTxSig, false
 	}
-	defer func(Body io.ReadCloser) {
-		_ = Body.Close()
-	}(resp.Body)
+	defer func(Body io.ReadCloser) { _ = Body.Close() }(resp.Body)
 
 	var result solanaResponse
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		log.Printf("Error decoding Solana response: %v\n", err)
-		return
+		log.Printf("Error decoding Solana response for %s: %v", wallet, err)
+		return lastTxSig, false
 	}
 
 	if len(result.Result) == 0 {
-		log.Println("No transactions found")
-		return
+		log.Printf("No transactions found for wallet %s", wallet)
+		return lastTxSig, false
 	}
 
 	latest := result.Result[0]
 	if latest.Signature != lastTxSig {
 		url := "https://solscan.io/tx/" + latest.Signature
-		log.Printf("New transaction found: %s\n", latest.Signature)
+		log.Printf("New transaction found for %s: %s", wallet, latest.Signature)
 
-		err := sendEmail("📥 New Solana Transaction!", fmt.Sprintf("New transaction on wallet %s\n\nDetails: %s", walletAddress, url))
+		err := sendEmail(
+			"📥 New Solana Transaction!",
+			fmt.Sprintf("New transaction on wallet %s\n\nDetails: %s", wallet, url),
+		)
+
 		if err != nil {
-			log.Printf("Error sending email: %v\n", err)
-		} else {
-			log.Println("Email sent successfully.")
-			lastTxSig = latest.Signature
-			writeLastTx(lastTxSig)
+			log.Printf("Error sending email: %v", err)
+			return lastTxSig, false
 		}
-	} else {
-		log.Println("No new transaction since last check.")
+
+		log.Printf("Email sent successfully for wallet %s", wallet)
+		return latest.Signature, true
 	}
+
+	log.Printf("No new transaction for wallet %s since last check.", wallet)
+	return lastTxSig, false
 }
 
 func main() {
 	log.Println("Starting Solana wallet notifier...")
 
-	if walletAddress == "" {
+	walletsEnv := os.Getenv("WALLET_ADDRESS")
+	if walletsEnv == "" {
 		log.Fatal("WALLET_ADDRESS env variable not set")
 	}
+
+	// Split wallet addresses by comma and trim whitespace
+	walletAddrs = strings.Split(walletsEnv, ",")
+	for i, wallet := range walletAddrs {
+		walletAddrs[i] = strings.TrimSpace(wallet)
+	}
+
+	log.Printf("Monitoring %d wallet addresses", len(walletAddrs))
+
 	if os.Getenv("SMTP_USER") == "" || os.Getenv("SMTP_PASS") == "" || os.Getenv("EMAIL_TO") == "" {
 		log.Fatal("SMTP_USER, SMTP_PASS, and EMAIL_TO env variables must be set")
 	}
 
-	lastTxSig = readLastTx()
-	log.Printf("Loaded last transaction from file: %s\n", lastTxSig)
+	// Load last transaction for each wallet
+	lastTxSigs := make(map[string]string)
+	for _, wallet := range walletAddrs {
+		lastTxSigs[wallet] = readLastTx(wallet)
+		log.Printf("Loaded last transaction for wallet %s: %s", wallet, lastTxSigs[wallet])
+	}
 
+	// Main monitoring loop
 	for {
-		checkTransactions()
+		for _, wallet := range walletAddrs {
+			lastSig, updated := checkTransactions(wallet, lastTxSigs[wallet])
+			if updated {
+				lastTxSigs[wallet] = lastSig
+				writeLastTx(wallet, lastSig)
+			}
+		}
 		time.Sleep(pollInterval)
 	}
 }
