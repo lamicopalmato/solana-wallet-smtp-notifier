@@ -8,6 +8,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -16,6 +17,7 @@ import (
 
 const (
 	pollInterval = 30 * time.Second
+	baseDir      = "/opt/solana-notifier"
 )
 
 var (
@@ -34,18 +36,48 @@ type solanaResponse struct {
 	ID int `json:"id"`
 }
 
+func initializeFiles() error {
+	// Crea la directory se non esiste
+	if err := os.MkdirAll(baseDir, 0755); err != nil {
+		return fmt.Errorf("failed to create directory %s: %w", baseDir, err)
+	}
+
+	log.Printf("Directory %s ready", baseDir)
+
+	// Crea i file per ogni wallet se non esistono
+	for _, wallet := range walletAddrs {
+		fileName := filepath.Join(baseDir, fmt.Sprintf("last_tx_%s.sig", wallet))
+
+		// Controlla se il file esiste
+		if _, err := os.Stat(fileName); os.IsNotExist(err) {
+			// File non esiste, crealo vuoto
+			err := os.WriteFile(fileName, []byte(""), 0644)
+			if err != nil {
+				return fmt.Errorf("failed to create file %s: %w", fileName, err)
+			}
+			log.Printf("Created new tracking file for wallet %s: %s", wallet, fileName)
+		} else if err != nil {
+			return fmt.Errorf("error checking file %s: %w", fileName, err)
+		} else {
+			log.Printf("Existing tracking file found for wallet %s: %s", wallet, fileName)
+		}
+	}
+
+	return nil
+}
+
 func readLastTx(wallet string) string {
-	fileName := fmt.Sprintf("/opt/solana-notifier/last_tx_%s.sig", wallet)
+	fileName := filepath.Join(baseDir, fmt.Sprintf("last_tx_%s.sig", wallet))
 	data, err := os.ReadFile(fileName)
 	if err != nil {
-		log.Printf("No last tx file found for wallet %s, starting fresh", wallet)
+		log.Printf("Error reading last tx file for wallet %s: %v", wallet, err)
 		return ""
 	}
 	return strings.TrimSpace(string(data))
 }
 
 func writeLastTx(wallet string, tx string) {
-	fileName := fmt.Sprintf("/opt/solana-notifier/last_tx_%s.sig", wallet)
+	fileName := filepath.Join(baseDir, fmt.Sprintf("last_tx_%s.sig", wallet))
 	err := os.WriteFile(fileName, []byte(tx), 0644)
 	if err != nil {
 		log.Printf("Error writing last tx file for wallet %s: %v", wallet, err)
@@ -141,19 +173,24 @@ func main() {
 		log.Fatal("WALLET_ADDRESS env variable not set")
 	}
 
-	// Split wallet addresses by comma and trim whitespace
+	// Parse wallet addresses
 	walletAddrs = strings.Split(walletsEnv, ",")
 	for i, wallet := range walletAddrs {
 		walletAddrs[i] = strings.TrimSpace(wallet)
 	}
-
 	log.Printf("Monitoring %d wallet addresses", len(walletAddrs))
 
+	// Verifica variabili di ambiente SMTP
 	if os.Getenv("SMTP_USER") == "" || os.Getenv("SMTP_PASS") == "" || os.Getenv("EMAIL_TO") == "" {
 		log.Fatal("SMTP_USER, SMTP_PASS, and EMAIL_TO env variables must be set")
 	}
 
-	// Load last transaction for each wallet
+	// Inizializza directory e file UNA SOLA VOLTA all'avvio
+	if err := initializeFiles(); err != nil {
+		log.Fatal(err)
+	}
+
+	// Carica le ultime transazioni per ogni wallet
 	lastTxSigs := make(map[string]string)
 	for _, wallet := range walletAddrs {
 		lastTxSigs[wallet] = readLastTx(wallet)
