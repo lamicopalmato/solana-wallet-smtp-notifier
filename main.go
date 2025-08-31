@@ -17,7 +17,7 @@ import (
 
 const (
 	pollInterval = 30 * time.Second
-	baseDir      = "/opt/solana-notifier"
+	baseDir      = "."
 )
 
 var (
